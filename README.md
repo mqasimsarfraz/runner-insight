@@ -84,7 +84,7 @@ jobs:
         with:
           gadgets: |
             snapshot_process --fields comm,pid --sort pid
-            snapshot_socket --fields proto,state,src,dst
+            snapshot_socket --fields src,dst,state
             trace_dns --filter 'name~github.com' --fields name,qtype,rcode
             trace_open --failed --fields fname,error
           timeout: "15"
