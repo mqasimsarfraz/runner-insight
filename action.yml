@@ -12,12 +12,13 @@ inputs:
   gadgets:
     description: |
       Newline-separated list of gadgets to run. Each line is a gadget name
-      followed by optional ig flags for filtering, field selection, etc.
-      The action controls -o (output) and -t (timeout) flags — do not set them here.
+      followed by optional ig flags for filtering, field selection, sorting, etc.
+      The action controls -t (timeout) — do not set it here. Use -o to override
+      the default output format (columns).
 
       Examples:
         snapshot_process --fields comm,pid --sort pid
-        trace_dns --filter 'name~github.com'
+        trace_dns --filter 'name~github.com' --fields name,qtype,rcode
         trace_open --failed --filter 'fname~/etc'
     required: true
   timeout:
@@ -28,10 +29,6 @@ inputs:
     description: "Pass --host to ig to show host-level data (not just containers). Default: true."
     required: false
     default: "true"
-  max-rows:
-    description: "Maximum rows to display per gadget in the Job Summary. Full output is saved to artifacts. Use 0 for unlimited."
-    required: false
-    default: "50"
   fail-on-error:
     description: "Fail the action if any gadget returns an error. Default: false (report-only mode)."
     required: false
@@ -59,79 +56,23 @@ runs:
         INPUT_GADGETS: ${{ inputs.gadgets }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_HOST: ${{ inputs.host }}
-        INPUT_MAX_ROWS: ${{ inputs.max-rows }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
       run: |
         set +e
 
         GADGET_NAME_REGEX='^[a-zA-Z0-9_-]+$'
         TIMEOUT="${INPUT_TIMEOUT:-10}"
-        MAX_ROWS="${INPUT_MAX_ROWS:-50}"
         HAS_FAILURE=0
         INDEX=0
 
         OUTPUT_DIR="$RUNNER_TEMP/runner-insight"
         mkdir -p "$OUTPUT_DIR"
 
-        # --- Helper: convert NDJSON to a markdown table ---
-        # Reads JSON lines from stdin, extracts keys from first line,
-        # renders a markdown table capped at MAX_ROWS rows.
-        json_to_md_table() {
-          local max_rows="$1"
-          local input
-          input=$(cat)
-
-          if [ -z "$input" ]; then
-            echo "_No data captured._"
-            return
-          fi
-
-          # Get headers from the first JSON line
-          local headers
-          headers=$(echo "$input" | head -1 | jq -r 'keys_unsorted | @tsv')
-          if [ -z "$headers" ]; then
-            echo "_Could not parse output._"
-            return
-          fi
-
-          local total_lines
-          total_lines=$(echo "$input" | wc -l)
-
-          # Table header
-          local header_row separator_row
-          header_row="| $(echo "$headers" | sed 's/\t/ | /g') |"
-          separator_row="| $(echo "$headers" | sed 's/[^\t]*/:---/g; s/\t/ | /g') |"
-
-          echo "$header_row"
-          echo "$separator_row"
-
-          # Table rows (capped)
-          local lines_to_show="$total_lines"
-          if [ "$max_rows" -gt 0 ] && [ "$total_lines" -gt "$max_rows" ]; then
-            lines_to_show="$max_rows"
-          fi
-
-          echo "$input" | head -"$lines_to_show" | while IFS= read -r json_line; do
-            local cols
-            cols=$(echo "$json_line" | jq -r '[.[] | tostring] | @tsv')
-            echo "| $(echo "$cols" | sed 's/\t/ | /g') |"
-          done
-
-          if [ "$max_rows" -gt 0 ] && [ "$total_lines" -gt "$max_rows" ]; then
-            echo ""
-            echo "_Showing ${max_rows} of ${total_lines} rows. Full output saved as artifact._"
-          fi
-        }
-
         # --- Reserved flags that users must not set ---
         check_reserved_flags() {
           local args=("$@")
           for arg in "${args[@]}"; do
             case "$arg" in
-              -o|--output|-o=*|--output=*)
-                echo "::error::Do not set -o/--output in gadget args — the action controls output format."
-                return 1
-                ;;
               -t|--timeout|-t=*|--timeout=*)
                 echo "::error::Do not set -t/--timeout in gadget args — use the 'timeout' action input instead."
                 return 1
@@ -174,18 +115,18 @@ runs:
             continue
           fi
 
-          # Build the ig command
-          IG_CMD=(sudo ig run "$GADGET_NAME" -o json -t "$TIMEOUT")
+          # Build the ig command — columns output by default
+          IG_CMD=(sudo ig run "$GADGET_NAME" -t "$TIMEOUT")
 
           # Add --host if enabled
           if [ "$INPUT_HOST" = "true" ]; then
             IG_CMD+=(--host)
           fi
 
-          # Add user's extra args
+          # Add user's extra args (may include -o override, --fields, --filter, etc.)
           IG_CMD+=("${EXTRA_ARGS[@]}")
 
-          JSON_FILE="$OUTPUT_DIR/${INDEX}-${GADGET_NAME}.json"
+          OUTPUT_FILE="$OUTPUT_DIR/${INDEX}-${GADGET_NAME}.txt"
           STDERR_FILE="$OUTPUT_DIR/${INDEX}-${GADGET_NAME}.stderr"
 
           # Build display label
@@ -199,7 +140,7 @@ runs:
           echo "Command: ${IG_CMD[*]}"
 
           START_TIME=$(date +%s%N)
-          "${IG_CMD[@]}" > "$JSON_FILE" 2> "$STDERR_FILE"
+          "${IG_CMD[@]}" > "$OUTPUT_FILE" 2> "$STDERR_FILE"
           EXIT_CODE=$?
           END_TIME=$(date +%s%N)
           DURATION_MS=$(( (END_TIME - START_TIME) / 1000000 ))
@@ -216,7 +157,6 @@ runs:
             STATUS_TEXT="error (exit $EXIT_CODE)"
             HAS_FAILURE=1
             echo "::warning::Gadget $GADGET_NAME failed with exit code $EXIT_CODE"
-            # Show stderr in the log
             if [ -s "$STDERR_FILE" ]; then
               cat "$STDERR_FILE"
             fi
@@ -231,19 +171,22 @@ runs:
             DURATION_FMT="$(( DURATION_MS / 1000 )).$((DURATION_MS % 1000 / 100))s"
           fi
 
+          # Count output lines (excluding empty)
+          TOTAL_LINES=0
+          if [ -s "$OUTPUT_FILE" ]; then
+            TOTAL_LINES=$(grep -c . "$OUTPUT_FILE" || true)
+          fi
+
           # --- Append to Job Summary ---
           {
-            echo "### ${STATUS} \`${DISPLAY_LABEL}\`"
-            echo ""
-            echo "> Duration: ${DURATION_FMT} · Status: ${STATUS_TEXT}"
+            echo "<details open>"
+            echo "<summary><strong>${STATUS} ${GADGET_NAME}</strong> · ${DURATION_FMT} · ${TOTAL_LINES} rows</summary>"
             echo ""
 
-            # Render output table from JSON
-            if [ -s "$JSON_FILE" ] && jq -e . "$JSON_FILE" > /dev/null 2>&1; then
-              json_to_md_table "$MAX_ROWS" < "$JSON_FILE"
-            elif [ -s "$JSON_FILE" ]; then
-              # NDJSON (one JSON object per line) — common for trace gadgets
-              json_to_md_table "$MAX_ROWS" < "$JSON_FILE"
+            if [ -s "$OUTPUT_FILE" ]; then
+              echo '```'
+              cat "$OUTPUT_FILE"
+              echo '```'
             else
               echo "_No output captured._"
             fi
@@ -251,18 +194,15 @@ runs:
             # Show stderr if present
             if [ -s "$STDERR_FILE" ]; then
               echo ""
-              echo "<details>"
-              echo "<summary>⚠️ Warnings/Errors</summary>"
-              echo ""
-              echo '```'
-              head -50 "$STDERR_FILE"
-              echo '```'
-              echo ""
-              echo "</details>"
+              echo "> ⚠️ **Warnings:**"
+              echo '>'
+              head -20 "$STDERR_FILE" | while IFS= read -r errline; do
+                echo "> \`$errline\`"
+              done
             fi
 
             echo ""
-            echo "---"
+            echo "</details>"
             echo ""
           } >> "$OUTPUT_DIR/summary.md"
 
