@@ -1,0 +1,140 @@
+name: "Runner Insight"
+description: "Run Inspektor Gadget gadgets on CI runners and generate a Job Summary report"
+branding:
+  icon: "activity"
+  color: "green"
+
+inputs:
+  ig-version:
+    description: "Version of ig to install (e.g. v0.51.1). Defaults to latest."
+    required: false
+    default: "latest"
+  gadgets:
+    description: |
+      Newline-separated list of gadgets to run.
+      Example:
+        snapshot_process
+        snapshot_socket
+        trace_dns
+    required: true
+  timeout:
+    description: "Timeout in seconds for each gadget (bounds trace gadgets; snapshots exit immediately)."
+    required: false
+    default: "10"
+  fail-on-error:
+    description: "Fail the action if any gadget returns an error. Default: false (report-only mode)."
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check platform
+      shell: bash
+      run: |
+        if [ "$(uname -s)" != "Linux" ]; then
+          echo "::error::runner-insight only supports Linux runners."
+          exit 1
+        fi
+
+    - name: Setup ig
+      uses: mqasimsarfraz/setup-ig@main
+      with:
+        version: ${{ inputs.ig-version }}
+
+    - name: Run gadgets and generate report
+      shell: bash
+      env:
+        INPUT_GADGETS: ${{ inputs.gadgets }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: |
+        set +e
+
+        GADGET_REGEX='^[a-zA-Z0-9_-]+$'
+        TIMEOUT="${INPUT_TIMEOUT:-10}"
+        HAS_FAILURE=0
+
+        # Start Job Summary
+        {
+          echo "## 🔍 Runner Insight Report"
+          echo ""
+          echo "| Gadget | Status | Duration |"
+          echo "|--------|--------|----------|"
+        } > "$RUNNER_TEMP/summary_table.md"
+
+        mkdir -p "$RUNNER_TEMP/gadget-output"
+
+        DETAILS=""
+
+        while IFS= read -r gadget; do
+          # Skip empty lines and comments
+          gadget=$(echo "$gadget" | xargs)
+          [ -z "$gadget" ] && continue
+          [[ "$gadget" =~ ^# ]] && continue
+
+          # Validate gadget name
+          if ! [[ "$gadget" =~ $GADGET_REGEX ]]; then
+            echo "::warning::Skipping invalid gadget name: $gadget"
+            continue
+          fi
+
+          echo "::group::Running gadget: $gadget"
+          OUTPUT_FILE="$RUNNER_TEMP/gadget-output/${gadget}.json"
+
+          START_TIME=$(date +%s)
+          timeout "${TIMEOUT}" sudo ig run "$gadget" -o json > "$OUTPUT_FILE" 2>&1
+          EXIT_CODE=$?
+          END_TIME=$(date +%s)
+          DURATION=$(( END_TIME - START_TIME ))
+
+          # timeout returns 124 when it kills the process — that's expected for trace gadgets
+          if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]; then
+            STATUS="✅"
+            echo "Gadget $gadget completed (exit=$EXIT_CODE, ${DURATION}s)"
+          else
+            STATUS="❌"
+            HAS_FAILURE=1
+            echo "::warning::Gadget $gadget failed with exit code $EXIT_CODE"
+          fi
+
+          echo "::endgroup::"
+
+          # Add table row
+          echo "| \`$gadget\` | $STATUS | ${DURATION}s |" >> "$RUNNER_TEMP/summary_table.md"
+
+          # Collect output for details section (truncate to 100 lines)
+          OUTPUT_CONTENT=$(head -100 "$OUTPUT_FILE" 2>/dev/null || echo "(no output)")
+          LINES=$(wc -l < "$OUTPUT_FILE" 2>/dev/null || echo "0")
+          TRUNCATED=""
+          if [ "$LINES" -gt 100 ]; then
+            TRUNCATED=" _(truncated to 100/${LINES} lines)_"
+          fi
+
+          DETAILS="${DETAILS}
+        <details>
+        <summary>${STATUS} <code>${gadget}</code> (${DURATION}s)${TRUNCATED}</summary>
+
+        \`\`\`json
+        ${OUTPUT_CONTENT}
+        \`\`\`
+
+        </details>
+        "
+
+        done <<< "$INPUT_GADGETS"
+
+        # Write the full Job Summary
+        {
+          cat "$RUNNER_TEMP/summary_table.md"
+          echo ""
+          echo "### Details"
+          echo ""
+          echo "$DETAILS"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Fail if requested and there were errors
+        if [ "$INPUT_FAIL_ON_ERROR" = "true" ] && [ "$HAS_FAILURE" -eq 1 ]; then
+          echo "::error::One or more gadgets failed. Set fail-on-error: false to report without failing."
+          exit 1
+        fi
