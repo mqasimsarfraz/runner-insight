@@ -11,16 +11,27 @@ inputs:
     default: "latest"
   gadgets:
     description: |
-      Newline-separated list of gadgets to run.
-      Example:
-        snapshot_process
-        snapshot_socket
-        trace_dns
+      Newline-separated list of gadgets to run. Each line is a gadget name
+      followed by optional ig flags for filtering, field selection, etc.
+      The action controls -o (output) and -t (timeout) flags — do not set them here.
+
+      Examples:
+        snapshot_process --fields comm,pid --sort pid
+        trace_dns --filter 'name~github.com'
+        trace_open --failed --filter 'fname~/etc'
     required: true
   timeout:
-    description: "Timeout in seconds for each gadget (bounds trace gadgets; snapshots exit immediately)."
+    description: "Default timeout in seconds for each gadget."
     required: false
     default: "10"
+  host:
+    description: "Pass --host to ig to show host-level data (not just containers). Default: true."
+    required: false
+    default: "true"
+  max-rows:
+    description: "Maximum rows to display per gadget in the Job Summary. Full output is saved to artifacts. Use 0 for unlimited."
+    required: false
+    default: "50"
   fail-on-error:
     description: "Fail the action if any gadget returns an error. Default: false (report-only mode)."
     required: false
@@ -47,91 +58,218 @@ runs:
       env:
         INPUT_GADGETS: ${{ inputs.gadgets }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_HOST: ${{ inputs.host }}
+        INPUT_MAX_ROWS: ${{ inputs.max-rows }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
       run: |
         set +e
 
-        GADGET_REGEX='^[a-zA-Z0-9_-]+$'
+        GADGET_NAME_REGEX='^[a-zA-Z0-9_-]+$'
         TIMEOUT="${INPUT_TIMEOUT:-10}"
+        MAX_ROWS="${INPUT_MAX_ROWS:-50}"
         HAS_FAILURE=0
+        INDEX=0
 
-        # Start Job Summary
+        OUTPUT_DIR="$RUNNER_TEMP/runner-insight"
+        mkdir -p "$OUTPUT_DIR"
+
+        # --- Helper: convert NDJSON to a markdown table ---
+        # Reads JSON lines from stdin, extracts keys from first line,
+        # renders a markdown table capped at MAX_ROWS rows.
+        json_to_md_table() {
+          local max_rows="$1"
+          local input
+          input=$(cat)
+
+          if [ -z "$input" ]; then
+            echo "_No data captured._"
+            return
+          fi
+
+          # Get headers from the first JSON line
+          local headers
+          headers=$(echo "$input" | head -1 | jq -r 'keys_unsorted | @tsv')
+          if [ -z "$headers" ]; then
+            echo "_Could not parse output._"
+            return
+          fi
+
+          local total_lines
+          total_lines=$(echo "$input" | wc -l)
+
+          # Table header
+          local header_row separator_row
+          header_row="| $(echo "$headers" | sed 's/\t/ | /g') |"
+          separator_row="| $(echo "$headers" | sed 's/[^\t]*/:---/g; s/\t/ | /g') |"
+
+          echo "$header_row"
+          echo "$separator_row"
+
+          # Table rows (capped)
+          local lines_to_show="$total_lines"
+          if [ "$max_rows" -gt 0 ] && [ "$total_lines" -gt "$max_rows" ]; then
+            lines_to_show="$max_rows"
+          fi
+
+          echo "$input" | head -"$lines_to_show" | while IFS= read -r json_line; do
+            local cols
+            cols=$(echo "$json_line" | jq -r '[.[] | tostring] | @tsv')
+            echo "| $(echo "$cols" | sed 's/\t/ | /g') |"
+          done
+
+          if [ "$max_rows" -gt 0 ] && [ "$total_lines" -gt "$max_rows" ]; then
+            echo ""
+            echo "_Showing ${max_rows} of ${total_lines} rows. Full output saved as artifact._"
+          fi
+        }
+
+        # --- Reserved flags that users must not set ---
+        check_reserved_flags() {
+          local args=("$@")
+          for arg in "${args[@]}"; do
+            case "$arg" in
+              -o|--output|-o=*|--output=*)
+                echo "::error::Do not set -o/--output in gadget args — the action controls output format."
+                return 1
+                ;;
+              -t|--timeout|-t=*|--timeout=*)
+                echo "::error::Do not set -t/--timeout in gadget args — use the 'timeout' action input instead."
+                return 1
+                ;;
+            esac
+          done
+          return 0
+        }
+
+        # --- Start Job Summary ---
         {
           echo "## 🔍 Runner Insight Report"
           echo ""
-          echo "| Gadget | Status | Duration |"
-          echo "|--------|--------|----------|"
-        } > "$RUNNER_TEMP/summary_table.md"
+        } > "$OUTPUT_DIR/summary.md"
 
-        mkdir -p "$RUNNER_TEMP/gadget-output"
-
-        DETAILS=""
-
-        while IFS= read -r gadget; do
+        while IFS= read -r line; do
+          # Trim whitespace
+          line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           # Skip empty lines and comments
-          gadget=$(echo "$gadget" | xargs)
-          [ -z "$gadget" ] && continue
-          [[ "$gadget" =~ ^# ]] && continue
+          [ -z "$line" ] && continue
+          [[ "$line" =~ ^# ]] && continue
+
+          INDEX=$((INDEX + 1))
+
+          # Parse the line into an array using Python's shlex (handles quoting correctly)
+          eval "ARGS=($(python3 -c "import shlex,sys; print(' '.join(shlex.quote(s) for s in shlex.split(sys.argv[1])))" "$line"))"
+
+          GADGET_NAME="${ARGS[0]}"
+          EXTRA_ARGS=("${ARGS[@]:1}")
 
           # Validate gadget name
-          if ! [[ "$gadget" =~ $GADGET_REGEX ]]; then
-            echo "::warning::Skipping invalid gadget name: $gadget"
+          if ! [[ "$GADGET_NAME" =~ $GADGET_NAME_REGEX ]]; then
+            echo "::warning::Skipping invalid gadget name: $GADGET_NAME"
             continue
           fi
 
-          echo "::group::Running gadget: $gadget"
-          OUTPUT_FILE="$RUNNER_TEMP/gadget-output/${gadget}.json"
+          # Check for reserved flags
+          if ! check_reserved_flags "${EXTRA_ARGS[@]}"; then
+            HAS_FAILURE=1
+            continue
+          fi
 
-          START_TIME=$(date +%s)
-          timeout "${TIMEOUT}" sudo ig run "$gadget" -o json > "$OUTPUT_FILE" 2>&1
+          # Build the ig command
+          IG_CMD=(sudo ig run "$GADGET_NAME" -o json -t "$TIMEOUT")
+
+          # Add --host if enabled
+          if [ "$INPUT_HOST" = "true" ]; then
+            IG_CMD+=(--host)
+          fi
+
+          # Add user's extra args
+          IG_CMD+=("${EXTRA_ARGS[@]}")
+
+          JSON_FILE="$OUTPUT_DIR/${INDEX}-${GADGET_NAME}.json"
+          STDERR_FILE="$OUTPUT_DIR/${INDEX}-${GADGET_NAME}.stderr"
+
+          # Build display label
+          if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+            DISPLAY_LABEL="${GADGET_NAME} ${EXTRA_ARGS[*]}"
+          else
+            DISPLAY_LABEL="${GADGET_NAME}"
+          fi
+
+          echo "::group::Running: ${DISPLAY_LABEL}"
+          echo "Command: ${IG_CMD[*]}"
+
+          START_TIME=$(date +%s%N)
+          "${IG_CMD[@]}" > "$JSON_FILE" 2> "$STDERR_FILE"
           EXIT_CODE=$?
-          END_TIME=$(date +%s)
-          DURATION=$(( END_TIME - START_TIME ))
+          END_TIME=$(date +%s%N)
+          DURATION_MS=$(( (END_TIME - START_TIME) / 1000000 ))
 
-          # timeout returns 124 when it kills the process — that's expected for trace gadgets
-          if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]; then
+          # Determine status
+          if [ $EXIT_CODE -eq 0 ]; then
             STATUS="✅"
-            echo "Gadget $gadget completed (exit=$EXIT_CODE, ${DURATION}s)"
+            STATUS_TEXT="success"
+          elif [ $EXIT_CODE -eq 124 ]; then
+            STATUS="⏱️"
+            STATUS_TEXT="timeout"
           else
             STATUS="❌"
+            STATUS_TEXT="error (exit $EXIT_CODE)"
             HAS_FAILURE=1
-            echo "::warning::Gadget $gadget failed with exit code $EXIT_CODE"
+            echo "::warning::Gadget $GADGET_NAME failed with exit code $EXIT_CODE"
+            # Show stderr in the log
+            if [ -s "$STDERR_FILE" ]; then
+              cat "$STDERR_FILE"
+            fi
           fi
 
           echo "::endgroup::"
 
-          # Add table row
-          echo "| \`$gadget\` | $STATUS | ${DURATION}s |" >> "$RUNNER_TEMP/summary_table.md"
-
-          # Collect output for details section (truncate to 100 lines)
-          OUTPUT_CONTENT=$(head -100 "$OUTPUT_FILE" 2>/dev/null || echo "(no output)")
-          LINES=$(wc -l < "$OUTPUT_FILE" 2>/dev/null || echo "0")
-          TRUNCATED=""
-          if [ "$LINES" -gt 100 ]; then
-            TRUNCATED=" _(truncated to 100/${LINES} lines)_"
+          # Format duration
+          if [ "$DURATION_MS" -lt 1000 ]; then
+            DURATION_FMT="${DURATION_MS}ms"
+          else
+            DURATION_FMT="$(( DURATION_MS / 1000 )).$((DURATION_MS % 1000 / 100))s"
           fi
 
-          DETAILS="${DETAILS}
-        <details>
-        <summary>${STATUS} <code>${gadget}</code> (${DURATION}s)${TRUNCATED}</summary>
+          # --- Append to Job Summary ---
+          {
+            echo "### ${STATUS} \`${DISPLAY_LABEL}\`"
+            echo ""
+            echo "> Duration: ${DURATION_FMT} · Status: ${STATUS_TEXT}"
+            echo ""
 
-        \`\`\`json
-        ${OUTPUT_CONTENT}
-        \`\`\`
+            # Render output table from JSON
+            if [ -s "$JSON_FILE" ] && jq -e . "$JSON_FILE" > /dev/null 2>&1; then
+              json_to_md_table "$MAX_ROWS" < "$JSON_FILE"
+            elif [ -s "$JSON_FILE" ]; then
+              # NDJSON (one JSON object per line) — common for trace gadgets
+              json_to_md_table "$MAX_ROWS" < "$JSON_FILE"
+            else
+              echo "_No output captured._"
+            fi
 
-        </details>
-        "
+            # Show stderr if present
+            if [ -s "$STDERR_FILE" ]; then
+              echo ""
+              echo "<details>"
+              echo "<summary>⚠️ Warnings/Errors</summary>"
+              echo ""
+              echo '```'
+              head -50 "$STDERR_FILE"
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+
+            echo ""
+            echo "---"
+            echo ""
+          } >> "$OUTPUT_DIR/summary.md"
 
         done <<< "$INPUT_GADGETS"
 
-        # Write the full Job Summary
-        {
-          cat "$RUNNER_TEMP/summary_table.md"
-          echo ""
-          echo "### Details"
-          echo ""
-          echo "$DETAILS"
-        } >> "$GITHUB_STEP_SUMMARY"
+        # Write summary to GITHUB_STEP_SUMMARY
+        cat "$OUTPUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
 
         # Fail if requested and there were errors
         if [ "$INPUT_FAIL_ON_ERROR" = "true" ] && [ "$HAS_FAILURE" -eq 1 ]; then
