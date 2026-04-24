@@ -25646,12 +25646,14 @@ module.exports = {
 /***/ 5128:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const { execFileSync } = __nccwpck_require__(5317);
+const { execFileSync, execSync } = __nccwpck_require__(5317);
 const path = __nccwpck_require__(6928);
 const fs = __nccwpck_require__(9896);
 const os = __nccwpck_require__(857);
 
 const GADGET_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+const SOCKET_PATH = "/var/run/ig/ig.socket";
+const REMOTE_ADDRESS = `unix://${SOCKET_PATH}`;
 
 function runnerTemp() {
   return process.env.RUNNER_TEMP || os.tmpdir();
@@ -25661,6 +25663,14 @@ function outputDir() {
   const dir = path.join(runnerTemp(), "runner-insight");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function logFile() {
+  return path.join(outputDir(), "gadget.log");
+}
+
+function configFile() {
+  return path.join(outputDir(), "config.yaml");
 }
 
 function stateFile() {
@@ -25744,8 +25754,12 @@ function isTrace(name) {
 }
 
 module.exports = {
+  SOCKET_PATH,
+  REMOTE_ADDRESS,
   runnerTemp,
   outputDir,
+  logFile,
+  configFile,
   stateFile,
   saveState,
   loadState,
@@ -27675,6 +27689,7 @@ const core = __nccwpck_require__(7484);
 const { execSync } = __nccwpck_require__(5317);
 const fs = __nccwpck_require__(9896);
 const {
+  REMOTE_ADDRESS,
   loadState,
   sudo,
 } = __nccwpck_require__(5128);
@@ -27691,54 +27706,41 @@ async function post() {
   const sections = [];
 
   try {
-    // 1. Stop trace gadgets and collect output
+    // 1. Stop trace gadgets via gadgetctl delete
     if (state.traceGadgets && state.traceGadgets.length > 0) {
       for (const g of state.traceGadgets) {
-        core.startGroup(`Stopping trace: ${g.name} (PID: ${g.pid})`);
-
-        // Send SIGINT for graceful shutdown, then SIGKILL as fallback
-        try {
-          execSync(`sudo kill -INT ${g.pid} 2>/dev/null || true`);
-          execSync("sleep 1");
-          execSync(`sudo kill -9 ${g.pid} 2>/dev/null || true`);
-        } catch {
-          // ignore
+        core.startGroup(`Stopping trace: ${g.instanceName}`);
+        const deleteArgs = ["delete", g.instanceId || g.instanceName, "--remote-address", REMOTE_ADDRESS];
+        const result = sudo("gadgetctl", deleteArgs, { ignoreError: true });
+        if (result.exitCode !== 0) {
+          core.warning(`Failed to delete ${g.instanceName}: ${result.stderr}`);
+        } else {
+          core.info(`Stopped ${g.instanceName}`);
         }
-
-        const display =
-          g.args.length > 0 ? `${g.name} ${g.args.join(" ")}` : g.name;
-        let output = "";
-        let stderr = "";
-
-        try {
-          output = fs.readFileSync(g.outFile, "utf8").trim();
-        } catch {
-          output = "";
-        }
-        try {
-          stderr = fs.readFileSync(g.errFile, "utf8").trim();
-        } catch {
-          stderr = "";
-        }
-
-        const lines = output ? output.split("\n").filter(Boolean) : [];
-        const rows = lines.length > 1 ? lines.length - 1 : 0;
-
-        sections.push({
-          gadget: g.name,
-          display,
-          status: output ? "success" : "warning",
-          rows,
-          output: output || "_No events captured._",
-          stderr,
-        });
-
-        core.info(`Collected ${rows} rows from ${g.name}`);
         core.endGroup();
       }
     }
 
-    // 2. Run snapshot gadgets with timeout
+    // Give the logs operator a moment to flush
+    execSync("sleep 1");
+
+    // 2. Parse log file and build sections for trace gadgets
+    if (state.traceGadgets && state.traceGadgets.length > 0) {
+      const traceData = parseLogFile(state.logFile, state.traceGadgets);
+      for (const g of state.traceGadgets) {
+        const events = traceData[g.instanceId] || traceData[g.instanceName] || [];
+        const display = g.args.length > 0 ? `${g.name} ${g.args.join(" ")}` : g.name;
+        sections.push({
+          gadget: g.name,
+          display,
+          status: events.length > 0 ? "success" : "warning",
+          rows: events.length,
+          output: formatTraceEvents(events, g.args),
+        });
+      }
+    }
+
+    // 3. Run snapshot gadgets with timeout
     if (state.snapshotGadgets && state.snapshotGadgets.length > 0) {
       for (const g of state.snapshotGadgets) {
         core.startGroup(`Running snapshot: ${g.name}`);
@@ -27749,7 +27751,10 @@ async function post() {
       }
     }
 
-    // 3. Generate Job Summary
+    // 4. Kill daemon
+    killDaemon();
+
+    // 5. Generate Job Summary
     generateSummary(sections);
 
     if (failOnError && hasFailure) {
@@ -27759,6 +27764,7 @@ async function post() {
     }
   } catch (error) {
     core.warning(`runner-insight cleanup error: ${error.message}`);
+    killDaemon();
   }
 }
 
@@ -27798,6 +27804,137 @@ function runSnapshotGadget(g, useHost) {
   };
 }
 
+function parseLogFile(logFilePath, traceGadgets) {
+  const data = {};
+  for (const g of traceGadgets) {
+    data[g.instanceId] = [];
+    data[g.instanceName] = [];
+  }
+
+  if (!logFilePath || !fs.existsSync(logFilePath)) {
+    core.warning(`Log file not found: ${logFilePath}`);
+    return data;
+  }
+
+  const instanceMap = {};
+  for (const g of traceGadgets) {
+    if (g.instanceId) instanceMap[g.instanceId] = g;
+    instanceMap[g.instanceName] = g;
+  }
+
+  const content = fs.readFileSync(logFilePath, "utf8");
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.type !== "gadget-data") continue;
+
+      const id = entry.instanceID || "";
+
+      // Match by instanceID
+      const g = instanceMap[id];
+      if (!g) continue;
+
+      if (entry.data) {
+        if (Array.isArray(entry.data)) {
+          data[g.instanceId].push(...entry.data);
+        } else {
+          data[g.instanceId].push(entry.data);
+        }
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  return data;
+}
+
+function formatTraceEvents(events, userArgs) {
+  if (events.length === 0) return "_No events captured._";
+
+  // Determine which fields to show
+  const requestedFields = getRequestedFields(userArgs);
+
+  // Use requested fields if specified, otherwise pick sensible defaults from the first event
+  let keys;
+  if (requestedFields.length > 0) {
+    keys = requestedFields;
+  } else {
+    keys = selectDisplayFields(events[0]);
+  }
+
+  const header = keys.join("\t");
+  const MAX_ROWS = 100;
+  const rows = events.slice(0, MAX_ROWS).map((e) => {
+    return keys.map((k) => resolveField(e, k)).join("\t");
+  });
+
+  let table = [header, ...rows].join("\n");
+  if (events.length > MAX_ROWS) {
+    table += `\n\n... ${events.length - MAX_ROWS} more events not shown`;
+  }
+  return table;
+}
+
+// Extract --fields value from user args
+function getRequestedFields(args) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--fields" && i + 1 < args.length) {
+      return args[i + 1].split(",").map((f) => f.trim());
+    }
+    if (args[i].startsWith("--fields=")) {
+      return args[i].slice("--fields=".length).split(",").map((f) => f.trim());
+    }
+  }
+  return [];
+}
+
+// Pick important top-level fields, skip runtime/k8s metadata
+function selectDisplayFields(event) {
+  const skip = new Set(["k8s", "runtime", "timestamp_raw", "mntns_id", "netns_id"]);
+  const fields = [];
+  for (const key of Object.keys(event)) {
+    if (skip.has(key)) continue;
+    const val = event[key];
+    if (typeof val === "object" && val !== null) continue;
+    fields.push(key);
+    if (fields.length >= 10) break;
+  }
+  return fields;
+}
+
+// Resolve potentially nested field paths like "src.addr"
+function resolveField(obj, fieldPath) {
+  const parts = fieldPath.split(".");
+  let val = obj;
+  for (const p of parts) {
+    if (val == null || typeof val !== "object") return "";
+    val = val[p];
+  }
+  if (val == null) return "";
+  if (typeof val === "object") return JSON.stringify(val);
+  return String(val);
+}
+
+function killDaemon() {
+  try {
+    const pids = execSync("pgrep -f 'ig daemon'", { encoding: "utf8" }).trim();
+    if (pids) {
+      for (const pid of pids.split("\n")) {
+        core.info(`Killing ig daemon (PID: ${pid.trim()})`);
+        try {
+          execSync(`sudo kill -9 ${pid.trim()} 2>/dev/null`);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  } catch {
+    // No daemon process found
+  }
+}
+
 function generateSummary(sections) {
   const lines = ["## 🔍 Runner Insight Report", ""];
 
@@ -27809,7 +27946,7 @@ function generateSummary(sections) {
           ? "⚠️"
           : "❌";
     const durationStr = s.duration ? ` · ${formatDuration(s.duration)}` : "";
-    const rowStr = s.rows !== undefined ? ` · ${s.rows} rows` : "";
+    const rowStr = s.rows !== undefined ? ` · ${s.rows} events` : "";
 
     lines.push(`<details open>`);
     lines.push(
@@ -27827,14 +27964,6 @@ function generateSummary(sections) {
       lines.push("```");
     } else {
       lines.push(s.output || "_No output captured._");
-    }
-
-    if (s.stderr) {
-      lines.push("");
-      lines.push("> ⚠️ **Warnings:**");
-      for (const errline of s.stderr.split("\n").slice(0, 10)) {
-        lines.push(`> \`${errline}\``);
-      }
     }
 
     lines.push("");

@@ -1,9 +1,11 @@
-const { execFileSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
 const GADGET_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+const SOCKET_PATH = "/var/run/ig/ig.socket";
+const REMOTE_ADDRESS = `unix://${SOCKET_PATH}`;
 
 function runnerTemp() {
   return process.env.RUNNER_TEMP || os.tmpdir();
@@ -13,6 +15,14 @@ function outputDir() {
   const dir = path.join(runnerTemp(), "runner-insight");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function logFile() {
+  return path.join(outputDir(), "gadget.log");
+}
+
+function configFile() {
+  return path.join(outputDir(), "config.yaml");
 }
 
 function stateFile() {
@@ -96,8 +106,12 @@ function isTrace(name) {
 }
 
 module.exports = {
+  SOCKET_PATH,
+  REMOTE_ADDRESS,
   runnerTemp,
   outputDir,
+  logFile,
+  configFile,
   stateFile,
   saveState,
   loadState,

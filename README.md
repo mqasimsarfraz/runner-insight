@@ -4,16 +4,26 @@ A GitHub Action that runs [Inspektor Gadget](https://github.com/inspektor-gadget
 
 > **Note:** This action only supports **Linux** runners with **sudo** access (GitHub-hosted Ubuntu runners work out of the box).
 
+## Prerequisites
+
+Install `ig` and `gadgetctl` using [`setup-ig`](https://github.com/mqasimsarfraz/setup-ig) before this action:
+
+```yaml
+- uses: mqasimsarfraz/setup-ig@main
+```
+
 ## Usage
 
-Place the action at the start of your job — trace gadgets run in the background during the entire job, and the report is generated automatically during cleanup:
+Place both actions at the start of your job — trace gadgets run in the background during the entire job, and the report is generated automatically during cleanup:
 
 ```yaml
 steps:
+  - uses: mqasimsarfraz/setup-ig@main
+
   - uses: mqasimsarfraz/runner-insight@main
     with:
       gadgets: |
-        trace_dns --filter 'name~github.com' --fields name,qtype,rcode
+        trace_dns --fields name,qtype,rcode
         trace_open --failed --fields fname,error
         snapshot_process --fields comm,pid --sort pid
 
@@ -28,24 +38,24 @@ steps:
 
 ## How It Works
 
-The action has two phases:
+The action uses the `ig daemon` with the [logs operator](https://www.inspektor-gadget.io/docs/latest/reference/operators/logs) for reliable event collection:
 
 **At job start (`main`):**
-1. Installs the `ig` CLI
-2. Starts `ig daemon` with the [logs operator](https://github.com/inspektor-gadget/inspektor-gadget/pull/5410) writing to a file
-3. Starts trace gadgets (`trace_*`) in detached mode via `gadgetctl`
+1. Verifies `ig` and `gadgetctl` are installed
+2. Starts `ig daemon` with the logs operator writing detached gadget data to a file
+3. Starts trace gadgets (`trace_*`) in detached mode via `gadgetctl run --detach`
 
 **At job cleanup (`post`):**
-1. Runs snapshot gadgets (`snapshot_*`)
-2. Stops trace gadgets and reads the log file
-3. Generates a Job Summary report
-4. Cleans up the daemon
+1. Stops trace gadgets via `gadgetctl delete`
+2. Parses the NDJSON log file for trace events
+3. Runs snapshot gadgets (`snapshot_*`) with a timeout
+4. Generates a Job Summary report
+5. Cleans up the daemon
 
 ## Inputs
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `ig-version` | Version of ig to install (e.g. `v0.51.1`) | No | `latest` |
 | `gadgets` | Newline-separated gadgets with optional ig flags | **Yes** | — |
 | `host` | Pass `--host` to show host-level data | No | `true` |
 | `fail-on-error` | Fail the action if any gadget errors | No | `false` |
@@ -63,8 +73,8 @@ Each line supports ig's native flags — you control exactly what appears in the
 
 ```yaml
 gadgets: |
-  # DNS queries to external domains during CI
-  trace_dns --filter 'name~github.com' --fields name,qtype,rcode
+  # DNS queries during CI
+  trace_dns --fields name,qtype,rcode
 
   # Failed file opens — catches missing deps, wrong paths
   trace_open --failed --fields fname,error
@@ -95,11 +105,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - uses: mqasimsarfraz/setup-ig@main
+
       - uses: mqasimsarfraz/runner-insight@main
         with:
           gadgets: |
             trace_dns --fields name,qtype,rcode
             trace_open --failed --fields fname,error
+            snapshot_process --fields comm,pid --sort pid
 
       - uses: actions/checkout@v4
       - run: npm install

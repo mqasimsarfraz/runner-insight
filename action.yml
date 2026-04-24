@@ -5,10 +5,6 @@ branding:
   color: "green"
 
 inputs:
-  ig-version:
-    description: "Version of ig to install (e.g. v0.51.1). Defaults to latest."
-    required: false
-    default: "latest"
   gadgets:
     description: |
       Newline-separated list of gadgets to run. Each line is a gadget name
@@ -18,12 +14,12 @@ inputs:
       data until the end. Snapshot gadgets (snapshot_*) run during cleanup.
 
       Examples:
-        trace_dns --filter 'name~github.com' --fields name,qtype,rcode
+        trace_dns --fields name,qtype,rcode
         trace_open --failed --fields fname,error
         snapshot_process --fields comm,pid --sort pid
     required: true
   host:
-    description: "Pass --host to ig to show host-level data (not just containers). Default: true."
+    description: "Pass --host to ig/gadgetctl to show host-level data (not just containers). Default: true."
     required: false
     default: "true"
   fail-on-error:
