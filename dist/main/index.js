@@ -25646,13 +25646,12 @@ module.exports = {
 /***/ 5128:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const { execSync, execFileSync } = __nccwpck_require__(5317);
+const { execFileSync } = __nccwpck_require__(5317);
 const path = __nccwpck_require__(6928);
 const fs = __nccwpck_require__(9896);
 const os = __nccwpck_require__(857);
 
 const GADGET_NAME_RE = /^[a-zA-Z0-9_-]+$/;
-const SOCKET_PATH = "/var/run/ig/ig.socket";
 
 function runnerTemp() {
   return process.env.RUNNER_TEMP || os.tmpdir();
@@ -25662,14 +25661,6 @@ function outputDir() {
   const dir = path.join(runnerTemp(), "runner-insight");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
-}
-
-function logFile() {
-  return path.join(outputDir(), "gadget.log");
-}
-
-function configFile() {
-  return path.join(outputDir(), "config.yaml");
 }
 
 function stateFile() {
@@ -25753,11 +25744,8 @@ function isTrace(name) {
 }
 
 module.exports = {
-  SOCKET_PATH,
   runnerTemp,
   outputDir,
-  logFile,
-  configFile,
   stateFile,
   saveState,
   loadState,
@@ -27688,10 +27676,7 @@ const { execSync } = __nccwpck_require__(5317);
 const fs = __nccwpck_require__(9896);
 const os = __nccwpck_require__(857);
 const {
-  SOCKET_PATH,
   outputDir,
-  logFile,
-  configFile,
   saveState,
   parseGadgetLine,
   sudo,
@@ -27700,7 +27685,6 @@ const {
 
 async function main() {
   try {
-    // Platform check
     if (os.platform() !== "linux") {
       core.setFailed("runner-insight only supports Linux runners.");
       return;
@@ -27710,7 +27694,6 @@ async function main() {
     const gadgetsInput = core.getInput("gadgets", { required: true });
     const useHost = core.getInput("host") !== "false";
 
-    // Parse gadget lines
     const gadgetLines = gadgetsInput
       .split("\n")
       .map((l) => parseGadgetLine(l))
@@ -27729,56 +27712,48 @@ async function main() {
     installIg(igVersion);
     core.endGroup();
 
+    const dir = outputDir();
     const state = {
-      outputDir: outputDir(),
-      logFile: logFile(),
+      outputDir: dir,
       useHost,
       snapshotGadgets,
       traceGadgets: [],
-      daemonPid: null,
     };
 
-    // If we have trace gadgets, start the daemon
-    if (traceGadgets.length > 0) {
-      core.startGroup("Starting ig daemon");
-      state.daemonPid = startDaemon(state);
-      core.endGroup();
+    // Start trace gadgets as background processes writing to files
+    for (let i = 0; i < traceGadgets.length; i++) {
+      const g = traceGadgets[i];
+      const outFile = `${dir}/${i}-${g.name}.out`;
+      const errFile = `${dir}/${i}-${g.name}.err`;
+      const pidFile = `${dir}/${i}-${g.name}.pid`;
 
-      // Start trace gadgets in detached mode
-      for (let i = 0; i < traceGadgets.length; i++) {
-        const g = traceGadgets[i];
-        const instanceName = `ri-${i}-${g.name}`;
-        core.startGroup(`Starting trace gadget: ${g.name}`);
+      core.startGroup(`Starting trace gadget: ${g.name}`);
 
-        const args = [
-          "run",
-          g.name,
-          "--detach",
-          "--name",
-          instanceName,
-          "--remote-address",
-          `unix://${SOCKET_PATH}`,
-        ];
-        if (useHost) args.push("--host");
-        args.push(...g.args);
+      const args = ["ig", "run", g.name, "-o", "columns"];
+      if (useHost) args.push("--host");
+      args.push(...g.args);
 
-        const result = sudo("gadgetctl", args, { ignoreError: true });
-        if (result.exitCode !== 0) {
-          core.warning(
-            `Failed to start ${g.name}: ${result.stderr || result.stdout}`
-          );
-        } else {
-          core.info(`Started ${instanceName}`);
-          state.traceGadgets.push({
-            ...g,
-            instanceName,
-          });
-        }
-        core.endGroup();
+      const cmd = `sudo ${args.map(shellEscape).join(" ")} > ${outFile} 2> ${errFile} & echo $! > ${pidFile}`;
+      core.info(`Command: ${cmd}`);
+
+      try {
+        execSync(`bash -c '${cmd}'`, { stdio: "inherit" });
+        const pid = fs.readFileSync(pidFile, "utf8").trim();
+        core.info(`Started ${g.name} (PID: ${pid})`);
+        state.traceGadgets.push({
+          ...g,
+          index: i,
+          pid: parseInt(pid),
+          outFile,
+          errFile,
+        });
+      } catch (err) {
+        core.warning(`Failed to start ${g.name}: ${err.message}`);
       }
+
+      core.endGroup();
     }
 
-    // Save state for post step
     saveState(state);
     core.info(
       `Runner Insight: ${state.traceGadgets.length} trace gadget(s) running, ${snapshotGadgets.length} snapshot(s) queued for cleanup.`
@@ -27789,7 +27764,6 @@ async function main() {
 }
 
 function installIg(version) {
-  // Determine version
   let ver = version;
   if (ver === "latest") {
     ver = execSync(
@@ -27799,61 +27773,26 @@ function installIg(version) {
   }
   if (!ver.startsWith("v")) ver = `v${ver}`;
 
-  // Determine arch
   const arch = os.arch() === "x64" ? "amd64" : "arm64";
   const url = `https://github.com/inspektor-gadget/inspektor-gadget/releases/download/${ver}/ig-linux-${arch}-${ver}.tar.gz`;
 
   core.info(`Downloading ig ${ver} for linux/${arch}...`);
-  execSync(`curl -sSL "${url}" -o /tmp/ig.tar.gz && tar -xzf /tmp/ig.tar.gz -C /tmp ig`, {
-    stdio: "inherit",
-  });
-  execSync("sudo install /tmp/ig /usr/local/bin/ig && rm -f /tmp/ig /tmp/ig.tar.gz", {
-    stdio: "inherit",
-  });
+  execSync(
+    `curl -sSL "${url}" -o /tmp/ig.tar.gz && tar -xzf /tmp/ig.tar.gz -C /tmp ig`,
+    { stdio: "inherit" }
+  );
+  execSync(
+    "sudo install /tmp/ig /usr/local/bin/ig && rm -f /tmp/ig /tmp/ig.tar.gz",
+    { stdio: "inherit" }
+  );
 
   const result = sudo("ig", ["version"], { ignoreError: true });
   core.info(`ig version: ${result.stdout}`);
 }
 
-function startDaemon(state) {
-  // Write ig config enabling the logs operator
-  const config = `operator:
-  logs:
-    enabled: true
-    channel: file
-    filename: ${state.logFile}
-    format: json
-    mode: detached
-`;
-  fs.writeFileSync(configFile(), config);
-  core.info(`Config written to ${configFile()}`);
-
-  // Start daemon in background using nohup + shell
-  const pidFile = `${state.outputDir}/daemon.pid`;
-  execSync(
-    `sudo bash -c 'nohup ig daemon --config ${configFile()} > ${state.outputDir}/daemon.log 2>&1 & echo $! > ${pidFile}'`,
-    { stdio: "inherit" }
-  );
-
-  // Wait for socket
-  for (let i = 0; i < 20; i++) {
-    if (fs.existsSync(SOCKET_PATH)) {
-      core.info("ig daemon is ready.");
-      try {
-        return parseInt(fs.readFileSync(pidFile, "utf8").trim());
-      } catch {
-        return null;
-      }
-    }
-    execSync("sleep 0.5");
-  }
-
-  core.warning("ig daemon socket not found after 10s, proceeding anyway.");
-  try {
-    return parseInt(fs.readFileSync(pidFile, "utf8").trim());
-  } catch {
-    return null;
-  }
+function shellEscape(s) {
+  if (/^[a-zA-Z0-9_.\/=-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 main();
