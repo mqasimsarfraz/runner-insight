@@ -148,10 +148,12 @@ function parseLogFile(logFilePath, traceGadgets) {
       if (entry.type !== "gadget-data") continue;
 
       const logId = entry.instanceID || "";
+      const logGadget = entry.gadget || "";
 
-      // Match by instanceID prefix (gadgetctl list returns short IDs)
+      // Match by instanceID prefix, or fall back to gadget name if ID is missing
       const g = traceGadgets.find(
-        (g) => g.instanceId && logId.startsWith(g.instanceId)
+        (g) => (g.instanceId && logId.startsWith(g.instanceId)) ||
+               (!g.instanceId && g.name === logGadget)
       );
       if (!g) continue;
 

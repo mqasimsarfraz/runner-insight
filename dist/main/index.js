@@ -27842,17 +27842,32 @@ async function main() {
   }
 }
 
-// Look up instance ID by name via gadgetctl list
+// Look up instance ID by name via gadgetctl list (with retries)
 function getInstanceId(instanceName) {
-  const result = sudo("gadgetctl", ["list", "--remote-address", REMOTE_ADDRESS], {
-    ignoreError: true,
-  });
-  if (result.exitCode !== 0) return "";
-  for (const line of result.stdout.split("\n")) {
-    if (line.includes(instanceName)) {
-      // First column is the ID (12-char hex prefix)
-      const id = line.trim().split(/\s+/)[0];
-      if (id && /^[a-f0-9]+$/.test(id)) return id;
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = sudo("gadgetctl", ["list", "--remote-address", REMOTE_ADDRESS], {
+      ignoreError: true,
+    });
+    if (result.exitCode !== 0) {
+      core.debug(`gadgetctl list failed (attempt ${attempt}): ${result.stderr}`);
+      if (attempt < maxAttempts) {
+        execSync("sleep 1");
+        continue;
+      }
+      return "";
+    }
+    for (const line of result.stdout.split("\n")) {
+      if (line.includes(instanceName)) {
+        const id = line.trim().split(/\s+/)[0];
+        if (id && /^[a-f0-9]+$/.test(id)) return id;
+      }
+    }
+    if (attempt < maxAttempts) {
+      core.debug(`Instance ${instanceName} not found in list (attempt ${attempt}), retrying...`);
+      execSync("sleep 1");
+    } else {
+      core.warning(`Instance ${instanceName} not found after ${maxAttempts} attempts. gadgetctl list output:\n${result.stdout}`);
     }
   }
   return "";
