@@ -25762,7 +25762,8 @@ function sudo(cmd, args = [], opts = {}) {
 }
 
 function isTrace(name) {
-  return name.startsWith("trace_") || name.startsWith("trace-");
+  return name.startsWith("trace_") || name.startsWith("trace-") ||
+         name.startsWith("top_") || name.startsWith("top-");
 }
 
 module.exports = {
