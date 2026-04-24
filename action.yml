@@ -13,18 +13,15 @@ inputs:
     description: |
       Newline-separated list of gadgets to run. Each line is a gadget name
       followed by optional ig flags for filtering, field selection, sorting, etc.
-      The action controls -t (timeout) — do not set it here. Use -o to override
-      the default output format (columns).
+
+      Trace gadgets (trace_*) start at the beginning of the job and collect
+      data until the end. Snapshot gadgets (snapshot_*) run during cleanup.
 
       Examples:
-        snapshot_process --fields comm,pid --sort pid
         trace_dns --filter 'name~github.com' --fields name,qtype,rcode
-        trace_open --failed --filter 'fname~/etc'
+        trace_open --failed --fields fname,error
+        snapshot_process --fields comm,pid --sort pid
     required: true
-  timeout:
-    description: "Default timeout in seconds for each gadget."
-    required: false
-    default: "10"
   host:
     description: "Pass --host to ig to show host-level data (not just containers). Default: true."
     required: false
@@ -35,184 +32,7 @@ inputs:
     default: "false"
 
 runs:
-  using: "composite"
-  steps:
-    - name: Check platform
-      shell: bash
-      run: |
-        if [ "$(uname -s)" != "Linux" ]; then
-          echo "::error::runner-insight only supports Linux runners."
-          exit 1
-        fi
-
-    - name: Setup ig
-      uses: mqasimsarfraz/setup-ig@main
-      with:
-        version: ${{ inputs.ig-version }}
-
-    - name: Run gadgets and generate report
-      shell: bash
-      env:
-        INPUT_GADGETS: ${{ inputs.gadgets }}
-        INPUT_TIMEOUT: ${{ inputs.timeout }}
-        INPUT_HOST: ${{ inputs.host }}
-        INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
-      run: |
-        set +e
-
-        GADGET_NAME_REGEX='^[a-zA-Z0-9_-]+$'
-        TIMEOUT="${INPUT_TIMEOUT:-10}"
-        HAS_FAILURE=0
-        INDEX=0
-
-        OUTPUT_DIR="$RUNNER_TEMP/runner-insight"
-        mkdir -p "$OUTPUT_DIR"
-
-        # --- Reserved flags that users must not set ---
-        check_reserved_flags() {
-          local args=("$@")
-          for arg in "${args[@]}"; do
-            case "$arg" in
-              -t|--timeout|-t=*|--timeout=*)
-                echo "::error::Do not set -t/--timeout in gadget args — use the 'timeout' action input instead."
-                return 1
-                ;;
-            esac
-          done
-          return 0
-        }
-
-        # --- Start Job Summary ---
-        {
-          echo "## 🔍 Runner Insight Report"
-          echo ""
-        } > "$OUTPUT_DIR/summary.md"
-
-        while IFS= read -r line; do
-          # Trim whitespace
-          line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-          # Skip empty lines and comments
-          [ -z "$line" ] && continue
-          [[ "$line" =~ ^# ]] && continue
-
-          INDEX=$((INDEX + 1))
-
-          # Parse the line into an array using Python's shlex (handles quoting correctly)
-          eval "ARGS=($(python3 -c "import shlex,sys; print(' '.join(shlex.quote(s) for s in shlex.split(sys.argv[1])))" "$line"))"
-
-          GADGET_NAME="${ARGS[0]}"
-          EXTRA_ARGS=("${ARGS[@]:1}")
-
-          # Validate gadget name
-          if ! [[ "$GADGET_NAME" =~ $GADGET_NAME_REGEX ]]; then
-            echo "::warning::Skipping invalid gadget name: $GADGET_NAME"
-            continue
-          fi
-
-          # Check for reserved flags
-          if ! check_reserved_flags "${EXTRA_ARGS[@]}"; then
-            HAS_FAILURE=1
-            continue
-          fi
-
-          # Build the ig command — columns output by default
-          IG_CMD=(sudo ig run "$GADGET_NAME" -t "$TIMEOUT")
-
-          # Add --host if enabled
-          if [ "$INPUT_HOST" = "true" ]; then
-            IG_CMD+=(--host)
-          fi
-
-          # Add user's extra args (may include -o override, --fields, --filter, etc.)
-          IG_CMD+=("${EXTRA_ARGS[@]}")
-
-          OUTPUT_FILE="$OUTPUT_DIR/${INDEX}-${GADGET_NAME}.txt"
-          STDERR_FILE="$OUTPUT_DIR/${INDEX}-${GADGET_NAME}.stderr"
-
-          # Build display label
-          if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
-            DISPLAY_LABEL="${GADGET_NAME} ${EXTRA_ARGS[*]}"
-          else
-            DISPLAY_LABEL="${GADGET_NAME}"
-          fi
-
-          echo "::group::Running: ${DISPLAY_LABEL}"
-          echo "Command: ${IG_CMD[*]}"
-
-          START_TIME=$(date +%s%N)
-          "${IG_CMD[@]}" > "$OUTPUT_FILE" 2> "$STDERR_FILE"
-          EXIT_CODE=$?
-          END_TIME=$(date +%s%N)
-          DURATION_MS=$(( (END_TIME - START_TIME) / 1000000 ))
-
-          # Determine status
-          if [ $EXIT_CODE -eq 0 ]; then
-            STATUS="✅"
-            STATUS_TEXT="success"
-          elif [ $EXIT_CODE -eq 124 ]; then
-            STATUS="⏱️"
-            STATUS_TEXT="timeout"
-          else
-            STATUS="❌"
-            STATUS_TEXT="error (exit $EXIT_CODE)"
-            HAS_FAILURE=1
-            echo "::warning::Gadget $GADGET_NAME failed with exit code $EXIT_CODE"
-            if [ -s "$STDERR_FILE" ]; then
-              cat "$STDERR_FILE"
-            fi
-          fi
-
-          echo "::endgroup::"
-
-          # Format duration
-          if [ "$DURATION_MS" -lt 1000 ]; then
-            DURATION_FMT="${DURATION_MS}ms"
-          else
-            DURATION_FMT="$(( DURATION_MS / 1000 )).$((DURATION_MS % 1000 / 100))s"
-          fi
-
-          # Count output lines (excluding empty)
-          TOTAL_LINES=0
-          if [ -s "$OUTPUT_FILE" ]; then
-            TOTAL_LINES=$(grep -c . "$OUTPUT_FILE" || true)
-          fi
-
-          # --- Append to Job Summary ---
-          {
-            echo "<details open>"
-            echo "<summary><strong>${STATUS} ${GADGET_NAME}</strong> · ${DURATION_FMT} · ${TOTAL_LINES} rows</summary>"
-            echo ""
-
-            if [ -s "$OUTPUT_FILE" ]; then
-              echo '```'
-              cat "$OUTPUT_FILE"
-              echo '```'
-            else
-              echo "_No output captured._"
-            fi
-
-            # Show stderr if present
-            if [ -s "$STDERR_FILE" ]; then
-              echo ""
-              echo "> ⚠️ **Warnings:**"
-              echo '>'
-              head -20 "$STDERR_FILE" | while IFS= read -r errline; do
-                echo "> \`$errline\`"
-              done
-            fi
-
-            echo ""
-            echo "</details>"
-            echo ""
-          } >> "$OUTPUT_DIR/summary.md"
-
-        done <<< "$INPUT_GADGETS"
-
-        # Write summary to GITHUB_STEP_SUMMARY
-        cat "$OUTPUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
-
-        # Fail if requested and there were errors
-        if [ "$INPUT_FAIL_ON_ERROR" = "true" ] && [ "$HAS_FAILURE" -eq 1 ]; then
-          echo "::error::One or more gadgets failed. Set fail-on-error: false to report without failing."
-          exit 1
-        fi
+  using: "node20"
+  main: "dist/main/index.js"
+  post: "dist/post/index.js"
+  post-if: always()
