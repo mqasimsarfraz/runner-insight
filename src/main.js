@@ -66,6 +66,9 @@ async function main() {
     // Ensure socket dir and log file exist with correct permissions
     execSync("sudo mkdir -p /var/run/ig", { stdio: "inherit" });
     fs.writeFileSync(daemonLogPath, "");
+    // Pre-create gadget log file so daemon (root) appends to it and runner user can read
+    fs.writeFileSync(logPath, "");
+    execSync(`chmod 666 ${logPath}`, { stdio: "inherit" });
 
     execSync(
       `sudo bash -c 'nohup ig daemon --config ${configPath} >>${daemonLogPath} 2>&1 &'`,

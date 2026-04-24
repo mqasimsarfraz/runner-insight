@@ -27822,7 +27822,18 @@ function parseLogFile(logFilePath, traceGadgets) {
     instanceMap[g.instanceName] = g;
   }
 
-  const content = fs.readFileSync(logFilePath, "utf8");
+  let content;
+  try {
+    content = fs.readFileSync(logFilePath, "utf8");
+  } catch {
+    // Fall back to sudo if permission denied
+    const result = sudo("cat", [logFilePath], { ignoreError: true });
+    if (result.exitCode !== 0) {
+      core.warning(`Cannot read log file: ${result.stderr}`);
+      return data;
+    }
+    content = result.stdout;
+  }
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
     try {
