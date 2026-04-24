@@ -149,10 +149,10 @@ function getInstanceId(instanceName) {
   });
   if (result.exitCode !== 0) return "";
   for (const line of result.stdout.split("\n")) {
-    const cols = line.trim().split(/\s{2,}/);
-    // columns: ID, NAME, TAGS, GADGET, STATUS
-    if (cols.length >= 2 && cols[1] === instanceName) {
-      return cols[0].trim();
+    if (line.includes(instanceName)) {
+      // First column is the ID (12-char hex prefix)
+      const id = line.trim().split(/\s+/)[0];
+      if (id && /^[a-f0-9]+$/.test(id)) return id;
     }
   }
   return "";

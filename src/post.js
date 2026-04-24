@@ -41,7 +41,7 @@ async function post() {
     if (state.traceGadgets && state.traceGadgets.length > 0) {
       const traceData = parseLogFile(state.logFile, state.traceGadgets);
       for (const g of state.traceGadgets) {
-        const events = traceData[g.instanceId] || traceData[g.instanceName] || [];
+        const events = traceData[g.instanceName] || [];
         const display = g.args.length > 0 ? `${g.name} ${g.args.join(" ")}` : g.name;
         sections.push({
           gadget: g.name,
@@ -120,19 +120,12 @@ function runSnapshotGadget(g, useHost) {
 function parseLogFile(logFilePath, traceGadgets) {
   const data = {};
   for (const g of traceGadgets) {
-    data[g.instanceId] = [];
     data[g.instanceName] = [];
   }
 
   if (!logFilePath || !fs.existsSync(logFilePath)) {
     core.warning(`Log file not found: ${logFilePath}`);
     return data;
-  }
-
-  const instanceMap = {};
-  for (const g of traceGadgets) {
-    if (g.instanceId) instanceMap[g.instanceId] = g;
-    instanceMap[g.instanceName] = g;
   }
 
   let content;
@@ -147,23 +140,26 @@ function parseLogFile(logFilePath, traceGadgets) {
     }
     content = result.stdout;
   }
+
   for (const line of content.split("\n")) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
       if (entry.type !== "gadget-data") continue;
 
-      const id = entry.instanceID || "";
+      const logId = entry.instanceID || "";
 
-      // Match by instanceID
-      const g = instanceMap[id];
+      // Match by instanceID prefix (gadgetctl list returns short IDs)
+      const g = traceGadgets.find(
+        (g) => g.instanceId && logId.startsWith(g.instanceId)
+      );
       if (!g) continue;
 
       if (entry.data) {
         if (Array.isArray(entry.data)) {
-          data[g.instanceId].push(...entry.data);
+          data[g.instanceName].push(...entry.data);
         } else {
-          data[g.instanceId].push(entry.data);
+          data[g.instanceName].push(entry.data);
         }
       }
     } catch {
