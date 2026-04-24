@@ -79,12 +79,24 @@ function parseGadgetLine(line) {
 // Run a command, return { stdout, stderr, exitCode }
 function run(cmd, args = [], { ignoreError = false } = {}) {
   try {
-    const stdout = execFileSync(cmd, args, {
+    const result = require("child_process").spawnSync(cmd, args, {
       encoding: "utf8",
       timeout: 120_000,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    return { stdout: stdout.trim(), stderr: "", exitCode: 0 };
+    if (result.error) throw result.error;
+    if (result.status !== 0 && !ignoreError) {
+      const err = new Error(`Command failed: ${cmd} ${args.join(" ")}`);
+      err.status = result.status;
+      err.stdout = result.stdout;
+      err.stderr = result.stderr;
+      throw err;
+    }
+    return {
+      stdout: (result.stdout || "").trim(),
+      stderr: (result.stderr || "").trim(),
+      exitCode: result.status || 0,
+    };
   } catch (err) {
     if (ignoreError) {
       return {
