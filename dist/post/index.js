@@ -27769,7 +27769,7 @@ async function post() {
 }
 
 function runSnapshotGadget(g, useHost) {
-  const args = ["run", g.name, "-t", "30"];
+  const args = ["run", g.name, "-t", "5"];
   if (useHost) args.push("--host");
   args.push(...g.args);
 
