@@ -27702,6 +27702,7 @@ const core = __nccwpck_require__(7484);
 const { execSync } = __nccwpck_require__(5317);
 const fs = __nccwpck_require__(9896);
 const os = __nccwpck_require__(857);
+const crypto = __nccwpck_require__(6982);
 const {
   SOCKET_PATH,
   REMOTE_ADDRESS,
@@ -27799,6 +27800,7 @@ async function main() {
     for (let i = 0; i < traceGadgets.length; i++) {
       const g = traceGadgets[i];
       const instanceName = `ri-${i}-${g.name}`;
+      const instanceId = crypto.randomBytes(16).toString("hex");
 
       core.startGroup(`Starting trace gadget: ${g.name}`);
 
@@ -27806,6 +27808,7 @@ async function main() {
         "run", g.name,
         "--detach",
         "--name", instanceName,
+        "--id", instanceId,
         "--remote-address", REMOTE_ADDRESS,
       ];
       if (useHost) args.push("--host");
@@ -27818,9 +27821,6 @@ async function main() {
         core.endGroup();
         continue;
       }
-
-      // Look up instance ID via gadgetctl list
-      const instanceId = getInstanceId(instanceName);
 
       core.info(`Started ${g.name} as ${instanceName} (ID: ${instanceId})`);
       state.traceGadgets.push({
@@ -27840,37 +27840,6 @@ async function main() {
   } catch (error) {
     core.setFailed(`runner-insight failed: ${error.message}`);
   }
-}
-
-// Look up instance ID by name via gadgetctl list (with retries)
-function getInstanceId(instanceName) {
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const result = sudo("gadgetctl", ["list", "--remote-address", REMOTE_ADDRESS], {
-      ignoreError: true,
-    });
-    if (result.exitCode !== 0) {
-      core.debug(`gadgetctl list failed (attempt ${attempt}): ${result.stderr}`);
-      if (attempt < maxAttempts) {
-        execSync("sleep 1");
-        continue;
-      }
-      return "";
-    }
-    for (const line of result.stdout.split("\n")) {
-      if (line.includes(instanceName)) {
-        const id = line.trim().split(/\s+/)[0];
-        if (id && /^[a-f0-9]+$/.test(id)) return id;
-      }
-    }
-    if (attempt < maxAttempts) {
-      core.debug(`Instance ${instanceName} not found in list (attempt ${attempt}), retrying...`);
-      execSync("sleep 1");
-    } else {
-      core.warning(`Instance ${instanceName} not found after ${maxAttempts} attempts. gadgetctl list output:\n${result.stdout}`);
-    }
-  }
-  return "";
 }
 
 function verifyTools() {
