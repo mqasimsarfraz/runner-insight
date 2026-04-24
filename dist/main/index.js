@@ -27818,11 +27818,8 @@ async function main() {
         continue;
       }
 
-      // Parse instance ID from output: 'installed as "ID"'
-      const match = (result.stdout + "\n" + result.stderr).match(
-        /installed as "([a-f0-9]+)"/
-      );
-      const instanceId = match ? match[1] : "";
+      // Look up instance ID via gadgetctl list
+      const instanceId = getInstanceId(instanceName);
 
       core.info(`Started ${g.name} as ${instanceName} (ID: ${instanceId})`);
       state.traceGadgets.push({
@@ -27842,6 +27839,22 @@ async function main() {
   } catch (error) {
     core.setFailed(`runner-insight failed: ${error.message}`);
   }
+}
+
+// Look up instance ID by name via gadgetctl list
+function getInstanceId(instanceName) {
+  const result = sudo("gadgetctl", ["list", "--remote-address", REMOTE_ADDRESS], {
+    ignoreError: true,
+  });
+  if (result.exitCode !== 0) return "";
+  for (const line of result.stdout.split("\n")) {
+    const cols = line.trim().split(/\s{2,}/);
+    // columns: ID, NAME, TAGS, GADGET, STATUS
+    if (cols.length >= 2 && cols[1] === instanceName) {
+      return cols[0].trim();
+    }
+  }
+  return "";
 }
 
 function verifyTools() {
