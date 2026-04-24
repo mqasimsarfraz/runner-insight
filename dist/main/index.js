@@ -27749,22 +27749,18 @@ async function main() {
     // Start ig daemon
     core.startGroup("Starting ig daemon");
     const daemonLogPath = `${dir}/daemon.log`;
+
+    // Ensure socket dir and log file exist with correct permissions
+    execSync("sudo mkdir -p /var/run/ig", { stdio: "inherit" });
+    fs.writeFileSync(daemonLogPath, "");
+
     execSync(
-      `sudo setsid ig daemon --config ${configPath} >> ${daemonLogPath} 2>&1 &`,
+      `sudo bash -c 'nohup ig daemon --config ${configPath} >>${daemonLogPath} 2>&1 &'`,
       { stdio: "inherit" }
     );
 
-    // Wait for socket to appear
-    await waitForSocket(SOCKET_PATH, 15);
-
-    // Verify daemon is responsive
-    const listResult = sudo("gadgetctl", ["list", "--remote-address", REMOTE_ADDRESS], {
-      ignoreError: true,
-    });
-    if (listResult.exitCode !== 0) {
-      core.setFailed(`ig daemon not responsive: ${listResult.stderr}`);
-      return;
-    }
+    // Wait for socket with readiness polling
+    await waitForDaemon(SOCKET_PATH, REMOTE_ADDRESS, 30);
     core.info("ig daemon is running and responsive");
     core.endGroup();
 
@@ -27847,18 +27843,42 @@ function verifyTools() {
   }
 }
 
-function waitForSocket(socketPath, timeoutSec) {
+function waitForDaemon(socketPath, remoteAddress, timeoutSec) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
+    const daemonLogPath = `${outputDir()}/daemon.log`;
     const interval = setInterval(() => {
-      if (fs.existsSync(socketPath)) {
+      const elapsed = (Date.now() - start) / 1000;
+
+      if (!fs.existsSync(socketPath)) {
+        if (elapsed > timeoutSec) {
+          clearInterval(interval);
+          // Show daemon log for debugging
+          try {
+            const log = fs.readFileSync(daemonLogPath, "utf8").trim();
+            if (log) core.info(`Daemon log:\n${log}`);
+          } catch { /* ignore */ }
+          reject(new Error(`ig daemon socket not found after ${timeoutSec}s`));
+        }
+        return;
+      }
+
+      // Socket exists — try gadgetctl list as readiness check
+      const result = sudo("gadgetctl", ["list", "--remote-address", remoteAddress], {
+        ignoreError: true,
+      });
+      if (result.exitCode === 0) {
         clearInterval(interval);
         resolve();
-      } else if (Date.now() - start > timeoutSec * 1000) {
+      } else if (elapsed > timeoutSec) {
         clearInterval(interval);
-        reject(new Error(`ig daemon socket not found after ${timeoutSec}s`));
+        try {
+          const log = fs.readFileSync(daemonLogPath, "utf8").trim();
+          if (log) core.info(`Daemon log:\n${log}`);
+        } catch { /* ignore */ }
+        reject(new Error(`ig daemon not responsive after ${timeoutSec}s: ${result.stderr}`));
       }
-    }, 500);
+    }, 1000);
   });
 }
 
