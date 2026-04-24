@@ -70,14 +70,18 @@ async function main() {
     fs.writeFileSync(logPath, "");
     execSync(`chmod 666 ${logPath}`, { stdio: "inherit" });
 
+    const daemonPidFile = `${dir}/daemon.pid`;
     execSync(
-      `sudo bash -c 'nohup ig daemon --config ${configPath} >>${daemonLogPath} 2>&1 &'`,
+      `sudo bash -c 'nohup ig daemon --config ${configPath} >>${daemonLogPath} 2>&1 & echo $! > ${daemonPidFile}'`,
       { stdio: "inherit" }
     );
 
     // Wait for socket with readiness polling
     await waitForDaemon(SOCKET_PATH, REMOTE_ADDRESS, 30);
-    core.info("ig daemon is running and responsive");
+
+    let daemonPid = "";
+    try { daemonPid = fs.readFileSync(daemonPidFile, "utf8").trim(); } catch { /* ignore */ }
+    core.info(`ig daemon is running (PID: ${daemonPid})`);
     core.endGroup();
 
     const state = {
@@ -86,6 +90,7 @@ async function main() {
       logFile: logPath,
       configFile: configPath,
       daemonLogPath,
+      daemonPid,
       snapshotGadgets,
       traceGadgets: [],
     };

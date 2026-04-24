@@ -27764,7 +27764,7 @@ async function post() {
     }
 
     // 4. Kill daemon
-    killDaemon();
+    killDaemon(state);
 
     // 5. Generate Job Summary
     generateSummary(sections);
@@ -27776,7 +27776,7 @@ async function post() {
     }
   } catch (error) {
     core.warning(`runner-insight cleanup error: ${error.message}`);
-    killDaemon();
+    killDaemon(state);
   }
 }
 
@@ -27940,21 +27940,14 @@ function resolveField(obj, fieldPath) {
   return String(val);
 }
 
-function killDaemon() {
-  try {
-    const pids = execSync("pgrep -f 'ig daemon'", { encoding: "utf8" }).trim();
-    if (pids) {
-      for (const pid of pids.split("\n")) {
-        core.info(`Killing ig daemon (PID: ${pid.trim()})`);
-        try {
-          execSync(`sudo kill -9 ${pid.trim()} 2>/dev/null`);
-        } catch {
-          // ignore
-        }
-      }
+function killDaemon(state) {
+  if (state && state.daemonPid) {
+    core.info(`Killing ig daemon (PID: ${state.daemonPid})`);
+    try {
+      execSync(`sudo kill -9 ${state.daemonPid} 2>/dev/null || true`);
+    } catch {
+      // ignore
     }
-  } catch {
-    // No daemon process found
   }
 }
 
